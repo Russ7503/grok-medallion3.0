@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from itertools import combinations
+import time  # Added for retry sleep
 
 st.set_page_config(page_title="GrokMedallion 3.0", layout="wide")
 st.title("🦾 GrokMedallion Fund 3.0")
@@ -14,11 +15,11 @@ st.sidebar.header("Controls")
 universe = st.sidebar.multiselect(
     "Select Assets",
     ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'SPY', 'QQQ', 'TSLA', 'IWM'],
-    default=['AAPL', 'SPY', 'QQQ']  # Reduced to avoid rate limits
+    default=['AAPL', 'SPY', 'QQQ']
 )
 period = st.sidebar.selectbox("Backtest Period", ['3mo', '6mo', '1y', '2y'], index=0)
 
-# Data fetch – robust version
+# Data fetch with retry on empty result
 @st.cache_data(ttl=300)
 def fetch_data(tickers, period):
     if not tickers:
@@ -26,6 +27,7 @@ def fetch_data(tickers, period):
         return pd.DataFrame()
 
     try:
+        # First attempt
         df = yf.download(
             tickers,
             period=period,
@@ -33,13 +35,28 @@ def fetch_data(tickers, period):
             progress=False,
             auto_adjust=True,
             repair=True,
-            threads=False  # Prevents 'database is locked'
+            threads=False
         )
 
+        # Retry if empty
         if df.empty:
-            st.warning("yfinance returned empty data. Try shorter period or fewer symbols.")
+            st.info("First fetch empty – retrying...")
+            time.sleep(3)  # Avoid rate limit
+            df = yf.download(
+                tickers,
+                period=period,
+                interval='1d',
+                progress=False,
+                auto_adjust=True,
+                repair=True,
+                threads=False
+            )
+
+        if df.empty:
+            st.warning("yfinance returned empty data even after retry. Try shorter period or fewer symbols.")
             return pd.DataFrame()
 
+        # Handle column structure
         if isinstance(df.columns, pd.MultiIndex):
             if 'Close' in df.columns.levels[0]:
                 prices = df.xs('Close', level='Price', axis=1, drop_level=True)
@@ -63,7 +80,7 @@ def fetch_data(tickers, period):
         prices = prices.dropna(how='all').dropna(axis=0, how='any')
 
         if prices.empty:
-            st.warning("Data cleaned to empty.")
+            st.warning("Data cleaned to empty after processing.")
             return pd.DataFrame()
 
         return prices
@@ -140,11 +157,11 @@ with tab1:
 
 with tab2:
     st.subheader("Current Signals")
-    st.dataframe(signals.tail(10), use_container_width=True)  # ← Fixed line: full call with closing )
+    st.dataframe(signals.tail(10), use_container_width=True)
     active = len(signals[signals['signal'] != 0])
     if active > 0:
         st.success(f"{active} active signals right now!")
     else:
         st.info("No strong signals currently.")
 
-st.caption("GrokMedallion 3.0 – Refresh for latest data. Use 1–3 symbols to avoid limits.")
+st.caption("GrokMedallion 3.0 – Refresh for latest data. Use 1–3 symbols to avoid rate limits.")
