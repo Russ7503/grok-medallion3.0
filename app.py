@@ -10,83 +10,47 @@ st.set_page_config(page_title="GrokMedallion 3.0", layout="wide")
 st.title("🦾 GrokMedallion Fund 3.0")
 st.markdown("**Medallion Simulator v3** – Stat Arb + Regime Detection. Short-term edges.")
 
-# Sidebar Controls
+# Sidebar
 st.sidebar.header("Controls")
 universe = st.sidebar.multiselect(
-    "Select Assets",
+    "Select Assets (need at least 2 for pairs)",
     ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'SPY', 'QQQ', 'TSLA', 'IWM'],
-    default=['AAPL', 'SPY', 'QQQ']  # Reduced to help avoid rate limits
+    default=['AAPL', 'SPY']
 )
-period = st.sidebar.selectbox("Backtest Period", ['3mo', '6mo', '1y', '2y'], index=0)
+period = st.sidebar.selectbox("Backtest Period", ['3mo', '6mo', '1y', '2y'], index=2)  # Default 1y
 
-# Data fetch with retry on empty result
+# Data fetch with retry
 @st.cache_data(ttl=300)
 def fetch_data(tickers, period):
-    if not tickers:
-        st.error("No assets selected in the sidebar.")
+    if len(tickers) < 1:
+        st.error("Select at least 1 asset.")
         return pd.DataFrame()
 
     try:
-        # First attempt
-        df = yf.download(
-            tickers,
-            period=period,
-            interval='1d',
-            progress=False,
-            auto_adjust=True,
-            repair=True,
-            threads=False  # Prevents database lock in concurrent/cloud env
-        )
-
-        # Retry if empty
-        if df.empty:
-            st.info("First fetch empty – retrying once...")
-            time.sleep(3)  # Avoid rate limit
-            df = yf.download(
-                tickers,
-                period=period,
-                interval='1d',
-                progress=False,
-                auto_adjust=True,
-                repair=True,
-                threads=False
-            )
+        df = yf.download(tickers, period=period, interval='1d', progress=False, auto_adjust=True, repair=True, threads=False)
 
         if df.empty:
-            st.warning("yfinance returned empty data even after retry. Try shorter period or fewer symbols.")
+            st.info("First fetch empty – retrying...")
+            time.sleep(3)
+            df = yf.download(tickers, period=period, interval='1d', progress=False, auto_adjust=True, repair=True, threads=False)
+
+        if df.empty:
+            st.warning("No data after retry. Try '2y' or different symbols.")
             return pd.DataFrame()
 
-        # Handle column structure
+        # Column handling
         if isinstance(df.columns, pd.MultiIndex):
-            if 'Close' in df.columns.levels[0]:
-                prices = df.xs('Close', level='Price', axis=1, drop_level=True)
-            elif 'Adj Close' in df.columns.levels[0]:
-                prices = df.xs('Adj Close', level='Price', axis=1, drop_level=True)
-            else:
-                st.error("No usable price column ('Close' or 'Adj Close') found in multi-ticker data.")
-                return pd.DataFrame()
+            prices = df.xs('Close', level='Price', axis=1, drop_level=True) if 'Close' in df.columns.levels[0] else df.xs('Adj Close', level='Price', axis=1, drop_level=True)
         else:
-            if 'Close' in df.columns:
-                prices = df['Close']
-            elif 'Adj Close' in df.columns:
-                prices = df['Adj Close']
-            else:
-                st.error("No price column available in data.")
-                return pd.DataFrame()
-
+            prices = df['Close'] if 'Close' in df.columns else df['Adj Close']
             if isinstance(prices, pd.Series):
-                prices = prices.to_frame(name=tickers if isinstance(tickers, str) else tickers[0])
+                prices = prices.to_frame(name=tickers[0] if len(tickers) == 1 else 'Price')
 
         prices = prices.dropna(how='all').dropna(axis=0, how='any')
-
-        if prices.empty:
-            st.warning("Data cleaned to empty after processing.")
-            return pd.DataFrame()
-
         return prices
 
     except Exception as e:
-        st.error(f"yfinance download failed: {str(e)}\n\nTips:\n• Select only 1–3 symbols\n• Use '3mo' period\n• Wait 5–10 min if rate-limited")
+        st.error(f"Fetch error: {str(e)}")
         return pd.DataFrame()
 
 data = fetch_data(universe, period)
@@ -94,21 +58,31 @@ data = fetch_data(universe, period)
 if data.empty:
     st.stop()
 
-# Signal Generation
+# Debug data
+st.sidebar.write("Data rows:", len(data))
+st.sidebar.write("Columns:", list(data.columns))
+
+# Signals with debug
 def generate_signals(data):
+    if len(data.columns) < 2:
+        st.warning("Need at least 2 assets for pairs trading signals.")
+        return pd.DataFrame()
+
     try:
         signals = pd.DataFrame(index=data.index)
-        pairs = list(combinations(data.columns, 2))[:8]  # Reduced to avoid slowdown
+        pairs = list(combinations(data.columns, 2))[:10]
+
+        st.sidebar.info(f"Testing {len(pairs)} pairs")
 
         for a, b in pairs:
             hedge = data[a].mean() / data[b].mean()
             spread = data[a] - hedge * data[b]
-            roll_mean = spread.rolling(window=20, min_periods=1).mean()
-            roll_std = spread.rolling(window=20, min_periods=1).std()
+            roll_mean = spread.rolling(20, min_periods=5).mean()
+            roll_std = spread.rolling(20, min_periods=5).std()
             z = (spread - roll_mean) / roll_std
 
             rets = data[a].pct_change().fillna(0)
-            vol = rets.rolling(10, min_periods=1).std().fillna(0)
+            vol = rets.rolling(10, min_periods=5).std().fillna(0)
             regime = np.where(
                 (rets > rets.mean()) & (vol < vol.mean()), 1,
                 np.where((rets < rets.mean()) & (vol > vol.mean()), -1, 0)
@@ -119,17 +93,22 @@ def generate_signals(data):
             signals[f'{a}-{b}'] = sig
 
         final = signals.mean(axis=1)
+        st.sidebar.write("Raw final signal mean:", final.mean())
+
         final = np.where(final > 0.2, 1, np.where(final < -0.2, -1, 0))
         return pd.DataFrame({'signal': final, 'strength': np.abs(final)}, index=data.index)
 
     except Exception as e:
-        st.error(f"Signal generation failed: {str(e)}")
+        st.error(f"Signals error: {str(e)}")
         return pd.DataFrame()
 
 signals = generate_signals(data)
 
 # Backtest
 def backtest(data, signals):
+    if signals.empty:
+        return pd.Series(), 0, 0
+
     positions = signals['signal'].shift(1).fillna(0)
     rets = data.pct_change().mean(axis=1).fillna(0)
     strat_rets = positions * rets * 5
@@ -142,7 +121,7 @@ def backtest(data, signals):
 
 equity, sharpe, dd = backtest(data, signals)
 
-# UI Tabs
+# UI
 tab1, tab2 = st.tabs(["Backtest", "Live Signals"])
 
 with tab1:
@@ -151,17 +130,24 @@ with tab1:
     col1.metric("Sharpe Ratio", f"{sharpe:.2f}")
     col2.metric("Max Drawdown", f"{dd*100:.1f}%")
 
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=equity.index, y=equity, mode='lines', name='Equity Curve'))
-    st.plotly_chart(fig, use_container_width=True)
+    if not equity.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=equity.index, y=equity, mode='lines', name='Equity Curve'))
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("No equity curve – no signals generated.")
 
 with tab2:
     st.subheader("Current Signals")
-    st.dataframe(signals.tail(10), use_container_width=True)
-    active = len(signals[signals['signal'] != 0])
+    if signals.empty:
+        st.warning("No signals generated. Check debug info in sidebar.")
+    else:
+        st.dataframe(signals.tail(10), use_container_width=True)
+
+    active = len(signals[signals['signal'] != 0]) if not signals.empty else 0
     if active > 0:
         st.success(f"{active} active signals right now!")
     else:
         st.info("No strong signals currently.")
 
-st.caption("GrokMedallion 3.0 – Refresh for latest data. Use 1–3 symbols to avoid rate limits.")
+st.caption("GrokMedallion 3.0 – Refresh page. Sidebar debug info helps diagnose empty signals.")
