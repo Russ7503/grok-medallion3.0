@@ -14,19 +14,18 @@ st.sidebar.header("Controls")
 universe = st.sidebar.multiselect(
     "Select Assets",
     ['AAPL', 'MSFT', 'NVDA', 'GOOGL', 'AMZN', 'META', 'SPY', 'QQQ', 'TSLA', 'IWM'],
-    default=['AAPL', 'SPY', 'QQQ']  # Reduced default to help avoid rate limits
+    default=['AAPL', 'SPY', 'QQQ']  # Reduced to avoid rate limits
 )
-period = st.sidebar.selectbox("Backtest Period", ['3mo', '6mo', '1y', '2y'], index=0)  # Default to '3mo' for faster tests
+period = st.sidebar.selectbox("Backtest Period", ['3mo', '6mo', '1y', '2y'], index=0)
 
-# Data fetch – hardened against yfinance issues
+# Data fetch – robust version
 @st.cache_data(ttl=300)
 def fetch_data(tickers, period):
     if not tickers:
-        st.error("No assets selected in the sidebar.")
+        st.error("No assets selected.")
         return pd.DataFrame()
 
     try:
-        # Disable threads to prevent SQLite 'database is locked' in cloud/concurrent env
         df = yf.download(
             tickers,
             period=period,
@@ -34,51 +33,45 @@ def fetch_data(tickers, period):
             progress=False,
             auto_adjust=True,
             repair=True,
-            threads=False  # Critical fix for lock errors
+            threads=False  # Prevents 'database is locked'
         )
 
         if df.empty:
-            st.warning("yfinance returned empty data for selected symbols/period. Try fewer symbols or shorter period.")
+            st.warning("yfinance returned empty data. Try shorter period or fewer symbols.")
             return pd.DataFrame()
 
-        # Handle column structure safely
         if isinstance(df.columns, pd.MultiIndex):
-            # Prefer 'Close' (adjusted when auto_adjust=True)
             if 'Close' in df.columns.levels[0]:
                 prices = df.xs('Close', level='Price', axis=1, drop_level=True)
             elif 'Adj Close' in df.columns.levels[0]:
                 prices = df.xs('Adj Close', level='Price', axis=1, drop_level=True)
             else:
-                st.error("No usable price column ('Close' or 'Adj Close') found in multi-ticker data.")
+                st.error("No usable price column found in multi-ticker data.")
                 return pd.DataFrame()
         else:
-            # Single ticker or flat
             if 'Close' in df.columns:
                 prices = df['Close']
             elif 'Adj Close' in df.columns:
                 prices = df['Adj Close']
             else:
-                st.error("No price column available in data.")
+                st.error("No price column available.")
                 return pd.DataFrame()
 
-            # Series → DataFrame
             if isinstance(prices, pd.Series):
                 prices = prices.to_frame(name=tickers if isinstance(tickers, str) else tickers[0])
 
-        # Clean NaNs
         prices = prices.dropna(how='all').dropna(axis=0, how='any')
 
         if prices.empty:
-            st.warning("Data cleaned to empty. Check symbols or period.")
+            st.warning("Data cleaned to empty.")
             return pd.DataFrame()
 
         return prices
 
     except Exception as e:
-        st.error(f"yfinance download failed: {str(e)}\n\nTips:\n• Select only 1–3 symbols\n• Use '3mo' period\n• Wait 5–10 min if rate-limited")
+        st.error(f"yfinance error: {str(e)}\nTry 1–3 symbols and '3mo' period.")
         return pd.DataFrame()
 
-# Fetch
 data = fetch_data(universe, period)
 
 if data.empty:
@@ -88,7 +81,7 @@ if data.empty:
 def generate_signals(data):
     try:
         signals = pd.DataFrame(index=data.index)
-        pairs = list(combinations(data.columns, 2))[:8]  # Reduced to avoid slowdown/timeout
+        pairs = list(combinations(data.columns, 2))[:8]
 
         for a, b in pairs:
             hedge = data[a].mean() / data[b].mean()
@@ -113,7 +106,7 @@ def generate_signals(data):
         return pd.DataFrame({'signal': final, 'strength': np.abs(final)}, index=data.index)
 
     except Exception as e:
-        st.error(f"Signal generation failed: {str(e)}")
+        st.error(f"Signal error: {str(e)}")
         return pd.DataFrame()
 
 signals = generate_signals(data)
@@ -122,7 +115,7 @@ signals = generate_signals(data)
 def backtest(data, signals):
     positions = signals['signal'].shift(1).fillna(0)
     rets = data.pct_change().mean(axis=1).fillna(0)
-    strat_rets = positions * rets * 5  # 5x leverage
+    strat_rets = positions * rets * 5
     costs = positions.diff().abs() * 0.0005
     strat_rets -= costs
     equity = (1 + strat_rets).cumprod()
@@ -132,7 +125,7 @@ def backtest(data, signals):
 
 equity, sharpe, dd = backtest(data, signals)
 
-# UI
+# UI Tabs
 tab1, tab2 = st.tabs(["Backtest", "Live Signals"])
 
 with tab1:
@@ -147,4 +140,11 @@ with tab1:
 
 with tab2:
     st.subheader("Current Signals")
-    st.dataframe(signals.tail(10), use_container
+    st.dataframe(signals.tail(10), use_container_width=True)  # ← Fixed line: full call with closing )
+    active = len(signals[signals['signal'] != 0])
+    if active > 0:
+        st.success(f"{active} active signals right now!")
+    else:
+        st.info("No strong signals currently.")
+
+st.caption("GrokMedallion 3.0 – Refresh for latest data. Use 1–3 symbols to avoid limits.")
