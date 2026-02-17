@@ -1,5 +1,5 @@
-streamlit
-yfinance --upgrade   # or pin a recent stable: yfinance==0.2.54 (check latest on pypi.org/project/yfinance)
-pandas
-numpy
-plotly
+streamlit>=1.42.0
+yfinance>=0.2.50
+pandas>=2.2.0
+numpy>=2.0.0
+plotly>=5.20.0
